@@ -1,0 +1,9 @@
+/worker/target
+/worker/build
+/sensor/target
+node_modules
+.wrangler/
+.env*
+.dev.vars*
+!.dev.vars.example
+*.mmdb

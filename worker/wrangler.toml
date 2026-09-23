@@ -1,0 +1,21 @@
+name = "hive"
+main = "build/index.js"
+compatibility_date = "2026-09-19"
+
+routes = [
+  { pattern = "hive.xivlabs.tech", custom_domain = true }
+]
+
+[build]
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
+
+[vars]
+ALLOWED_ORIGINS = "https://xivlabs.tech,https://aps.xivlabs.tech"
+
+[triggers]
+crons = ["17 3 * * *"]
+
+[[d1_databases]]
+binding = "hive_db"
+database_name = "hive-db"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
