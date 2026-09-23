@@ -1,3 +1,4 @@
+mod blocklist;
 mod event;
 mod geo;
 mod http;
@@ -35,6 +36,13 @@ async fn main() {
     let http_addr = env_or("HIVE_HTTP_ADDR", "0.0.0.0:80");
     let state_dir = PathBuf::from(env_or("HIVE_STATE_DIR", "/var/lib/hive"));
     let geoip = std::env::var("HIVE_GEOIP_DB").ok().map(PathBuf::from);
+    let policy = blocklist::Policy {
+        min_hits: env_or("HIVE_BLOCKLIST_MIN", "3").parse().unwrap_or_else(|_| {
+            eprintln!("HIVE_BLOCKLIST_MIN must be a whole number");
+            std::process::exit(2);
+        }),
+        ignore: blocklist::parse_ignore(&env_or("HIVE_IGNORE_IPS", "")),
+    };
 
     let host_key = ssh::load_or_create_host_key(&state_dir.join("ssh_host_ed25519_key"))
         .unwrap_or_else(|e| {
@@ -58,7 +66,7 @@ async fn main() {
     eprintln!("hive-sensor: ssh on {ssh_addr}, http on {http_addr}, shipping to {ingest_url}");
 
     let s = shared.clone();
-    tokio::spawn(async move { s.shipper.run(ingest_url, secret).await });
+    tokio::spawn(async move { s.shipper.run(ingest_url, secret, policy).await });
     tokio::spawn(ssh::serve(ssh_listener, host_key, shared.clone()));
     tokio::spawn(http::serve(http_listener, shared.clone()));
 

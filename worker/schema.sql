@@ -14,6 +14,12 @@ CREATE TABLE IF NOT EXISTS events (
     ua        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS blocklist (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    body       TEXT    NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS snapshot (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     body       TEXT    NOT NULL,

@@ -4,8 +4,9 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::blocklist::Policy;
 use crate::event::{now_secs, Event};
 use crate::stats::Stats;
 
@@ -13,6 +14,8 @@ const MAX_QUEUED: usize = 50;
 const FEED_PER_FLUSH: usize = 10;
 const FLUSH_EVERY: Duration = Duration::from_secs(60);
 const MAX_BODY_BYTES: usize = 128 * 1024;
+const BLOCKLIST_EVERY: Duration = Duration::from_secs(3600);
+const MAX_BLOCKLIST_BYTES: usize = 480 * 1024;
 
 pub struct Shipper {
     stats: Mutex<Stats>,
@@ -86,14 +89,42 @@ impl Shipper {
         }
     }
 
-    pub async fn run(&self, ingest_url: String, secret: String) {
+    fn blocklist_body(&self, policy: &Policy) -> Vec<u8> {
+        let now = now_secs();
+        let mut entries = self.stats.lock().unwrap().blocklist(now, policy);
+        loop {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "sent_at": now,
+                "events": [],
+                "blocklist": entries,
+            }))
+            .expect("blocklist serializes");
+            if body.len() <= MAX_BLOCKLIST_BYTES || entries.is_empty() {
+                return body;
+            }
+            entries.truncate(entries.len() * 9 / 10);
+        }
+    }
+
+    pub async fn run(&self, ingest_url: String, secret: String, policy: Policy) {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .expect("http client");
         let mut tick = tokio::time::interval(FLUSH_EVERY);
+        let mut next_blocklist = Instant::now();
         loop {
             tick.tick().await;
+            if Instant::now() >= next_blocklist {
+                match send(&client, &ingest_url, &secret, self.blocklist_body(&policy)).await {
+                    Err(SendError::Retry(e)) => eprintln!("shipper: blocklist: {e}; retrying next minute"),
+                    Err(SendError::Reject(e)) => {
+                        eprintln!("shipper: ingest rejected the blocklist ({e}); trying again in an hour");
+                        next_blocklist = Instant::now() + BLOCKLIST_EVERY;
+                    }
+                    Ok(()) => next_blocklist = Instant::now() + BLOCKLIST_EVERY,
+                }
+            }
             if !self.dirty.swap(false, Ordering::Relaxed) {
                 continue;
             }
@@ -190,6 +221,25 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["events"].as_array().unwrap().len(), FEED_PER_FLUSH);
         assert_eq!(parsed["stats"]["total_24h"], MAX_QUEUED as u64);
+    }
+
+    #[test]
+    fn blocklist_body_has_full_ips_and_fits_the_worker_limit() {
+        let s = shipper();
+        for i in 0..crate::stats::BLOCKLIST_MAX {
+            let ip = format!("1.{}.{}.{}", i / 65536 + 1, (i / 256) % 256, i % 256);
+            let mut e = http_event(0);
+            e.addr = ip.parse().unwrap();
+            s.push(e);
+        }
+        let policy = Policy { min_hits: 1, ignore: vec![] };
+        let body = s.blocklist_body(&policy);
+        assert!(body.len() <= MAX_BLOCKLIST_BYTES, "{} bytes", body.len());
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 0);
+        assert!(parsed.get("stats").is_none());
+        assert_eq!(parsed["blocklist"].as_array().unwrap().len(), crate::stats::BLOCKLIST_MAX);
+        assert_eq!(parsed["blocklist"][0]["http"], 1);
     }
 
     #[test]

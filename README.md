@@ -1,6 +1,6 @@
 # hive
 
-A low-interaction honeypot with a live attack map. A small Rust sensor pretends to be an SSH server and a
+A low-interaction honeypot with a live attack map, weekly reports and a public blocklist. A small Rust sensor pretends to be an SSH server and a
 forgotten nginx box. Bots find it on their own. Every login attempt and web probe goes to a Cloudflare Worker,
 and [xivlabs.tech](https://xivlabs.tech/#attacks) shows them on a world map as they happen.
 
@@ -22,8 +22,11 @@ and [xivlabs.tech](https://xivlabs.tech/#attacks) shows them on a world map as t
   privileges and a syscall filter (`systemd-analyze security` exposure: 1.5). It gets
   `CAP_NET_BIND_SERVICE` only to bind ports 22 and 80.
 - **Isolated:** runs on its own VM, not on a home network or a machine that holds anything else.
-- **Privacy:** source IPs are masked to their network (`203.0.113.x`) inside the sensor, so full
-  addresses never leave the VM. The public API only shows masked IPs and countries.
+- **Privacy:** the live map and the public API only show masked networks (`203.0.113.x`) and countries.
+  Full addresses leave the VM only for the blocklist: addresses that attacked the honeypot at least
+  `HIVE_BLOCKLIST_MIN` times in the last 7 days are sent to the Worker once an hour, kept in one D1 row
+  behind `/export`, and published every Monday in [hive-blocklist](https://github.com/itsF4LCON/hive-blocklist).
+  Private and reserved ranges and anything in `HIVE_IGNORE_IPS` are never listed.
 
 ## Why the sensor does the counting
 
@@ -33,8 +36,9 @@ would use that up, and break other projects sharing the account.
 
 So the sensor counts every event in memory instead. It keeps hourly buckets for 7 days, saves them to
 `stats.json` so restarts don't lose history, and caps distinct keys per bucket so memory stays bounded.
-Once a minute it sends a single signed request with the stats snapshot and the 10 newest events. The Worker
-upserts one snapshot row, inserts those events and prunes the feed back to 500 rows. That's at most about
+Once a minute it sends a single signed request with the stats snapshot and the 10 newest events, and once an
+hour a second one with the blocklist. The Worker
+upserts one snapshot row, inserts those events and prunes the feed back to 500 rows, and the blocklist is one more upsert an hour. That's at most about
 21 rows written per minute (~30k a day) however hard the honeypot is hit. `/stats` reads one row and
 `/recent` reads only the rows it returns, both behind a 30s edge cache.
 
@@ -45,7 +49,7 @@ upserts one snapshot row, inserts those events and prunes the feed back to 500 r
 | `sensor/` | The Rust honeypot: SSH (`russh`), HTTP (`hyper`), GeoLite2 lookups, signed shipping |
 | `sensor/hive-sensor.service` | systemd unit |
 | `worker/` | Cloudflare Worker (Rust): `POST /ingest`, `GET /stats`, `GET /recent` |
-| `test/worker.sh` | Tests for the Worker's auth, validation, IP masking and CORS |
+| `test/worker.sh` | Tests for the Worker's auth, validation, IP masking, CORS and export |
 
 ## API
 
@@ -53,6 +57,7 @@ upserts one snapshot row, inserts those events and prunes the feed back to 500 r
 |---|---|
 | `POST /ingest` | Sensor only. Body is `{sent_at, events[≤50], stats?}`, signed with `X-Hive-Signature: hex(HMAC-SHA256(secret, body))`. Requests more than 5 min off the Worker's clock are rejected. The snapshot is size-capped and cleaned before it's stored. |
 | `GET /recent?limit=50` | Latest events (max 100) |
+| `GET /export` | Needs `Authorization: Bearer <HIVE_EXPORT_TOKEN>`. The latest snapshot plus the blocklist (`ip`, `ssh`, `http`, `last_seen`) and when it was last updated. Used by hive-blocklist's weekly Action. |
 | `GET /stats` | The latest snapshot: 24h/7d totals, unique sources, top usernames, passwords, paths, countries and user agents, and map points |
 
 The public endpoints are cached at the edge for 30s and only send CORS headers to origins in `ALLOWED_ORIGINS`.
@@ -67,6 +72,8 @@ wrangler d1 create hive-db             # put the id in wrangler.toml
 wrangler d1 execute hive-db --remote --file=schema.sql
 openssl rand -hex 32                    # the shared secret, keep it for the sensor too
 wrangler secret put HIVE_SECRET
+openssl rand -hex 32                    # a second token, for hive-blocklist's weekly Action
+wrangler secret put HIVE_EXPORT_TOKEN
 wrangler deploy                         # serves on hive.xivlabs.tech
 ```
 
@@ -150,14 +157,16 @@ From your own machine, `ssh root@<vm-ip>` should show up in the journal right aw
 | `HIVE_HTTP_ADDR` | `0.0.0.0:80` | |
 | `HIVE_STATE_DIR` | `/var/lib/hive` | Holds the SSH host key and `stats.json` |
 | `HIVE_GEOIP_DB` | unset | Path to GeoLite2-City `.mmdb` |
+| `HIVE_BLOCKLIST_MIN` | `3` | Attempts in 7 days before an address goes on the blocklist |
+| `HIVE_IGNORE_IPS` | unset | Comma-separated IPs or CIDRs that are never listed, e.g. your own address |
 
 ## Development
 
 ```bash
 # Worker
-cd worker && cp .dev.vars.example .dev.vars   # set HIVE_SECRET
+cd worker && cp .dev.vars.example .dev.vars   # set HIVE_SECRET and HIVE_EXPORT_TOKEN
 wrangler d1 execute hive-db --local --file=schema.sql && wrangler dev
-HIVE_SECRET=... ../test/worker.sh
+HIVE_SECRET=... HIVE_EXPORT_TOKEN=... ../test/worker.sh
 
 # Sensor, on unprivileged ports
 cd sensor && cargo test

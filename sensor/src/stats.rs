@@ -2,10 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
+use crate::blocklist::Policy;
 use crate::event::Event;
 
 const HOUR: i64 = 3600;
+const DAY: i64 = 24 * HOUR;
 const KEEP_HOURS: i64 = 7 * 24;
+const KEEP_DAYS: i64 = 7;
+const ATTACKER_CAP: usize = 10_000;
+pub const BLOCKLIST_MAX: usize = 5000;
 const MAP_CAP: usize = 300;
 const SOURCE_CAP: usize = 5000;
 const TOP_N: usize = 5;
@@ -24,9 +29,26 @@ struct Bucket {
     sources: HashSet<String>,
 }
 
+#[derive(Serialize, Deserialize, Default, Clone, Copy)]
+struct Hits {
+    ssh: u64,
+    http: u64,
+    last: i64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Stats {
     buckets: BTreeMap<i64, Bucket>,
+    #[serde(default)]
+    attackers: BTreeMap<i64, HashMap<String, Hits>>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct Entry {
+    pub ip: String,
+    pub ssh: u64,
+    pub http: u64,
+    pub last_seen: i64,
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -100,12 +122,47 @@ impl Stats {
         if b.sources.len() < SOURCE_CAP {
             b.sources.insert(e.ip.clone());
         }
-        self.prune(hour);
+
+        let day = (e.ts as i64).div_euclid(DAY) * DAY;
+        let seen = self.attackers.entry(day).or_default();
+        let ip = e.addr.to_string();
+        if seen.contains_key(&ip) || seen.len() < ATTACKER_CAP {
+            let h = seen.entry(ip).or_default();
+            match e.service {
+                "ssh" => h.ssh += 1,
+                _ => h.http += 1,
+            }
+            h.last = h.last.max(e.ts as i64);
+        }
+        self.prune(hour, day);
     }
 
-    fn prune(&mut self, current_hour: i64) {
+    fn prune(&mut self, current_hour: i64, current_day: i64) {
         let oldest = current_hour - (KEEP_HOURS - 1) * HOUR;
         self.buckets = self.buckets.split_off(&oldest);
+        self.attackers = self.attackers.split_off(&(current_day - (KEEP_DAYS - 1) * DAY));
+    }
+
+    pub fn blocklist(&self, now: f64, policy: &Policy) -> Vec<Entry> {
+        let today = (now as i64).div_euclid(DAY) * DAY;
+        let mut merged: HashMap<&str, Hits> = HashMap::new();
+        for seen in self.attackers.range(today - (KEEP_DAYS - 1) * DAY..).map(|(_, m)| m) {
+            for (ip, h) in seen {
+                let m = merged.entry(ip.as_str()).or_default();
+                m.ssh += h.ssh;
+                m.http += h.http;
+                m.last = m.last.max(h.last);
+            }
+        }
+        let mut out: Vec<Entry> = merged
+            .into_iter()
+            .filter(|(_, h)| h.ssh + h.http >= policy.min_hits)
+            .filter(|(ip, _)| ip.parse().is_ok_and(|ip| policy.allows(ip)))
+            .map(|(ip, h)| Entry { ip: ip.to_owned(), ssh: h.ssh, http: h.http, last_seen: h.last })
+            .collect();
+        out.sort_by(|a, b| (b.ssh + b.http).cmp(&(a.ssh + a.http)).then_with(|| a.ip.cmp(&b.ip)));
+        out.truncate(BLOCKLIST_MAX);
+        out
     }
 
     pub fn snapshot(&self, now: f64) -> Snapshot {
@@ -160,6 +217,8 @@ impl Stats {
 mod tests {
     use super::*;
     use crate::geo::Location;
+
+    use crate::blocklist::parse_ignore;
 
     fn ssh(ts: f64, ip: &str, user: &str, pass: &str) -> Event {
         let loc = Location { country: Some("NL".into()), city: None, lat: Some(52.37), lon: Some(4.89) };
@@ -221,5 +280,56 @@ mod tests {
         let loaded = Stats::load(&path);
         assert_eq!(loaded.snapshot(NOW).total_24h, 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn policy(min_hits: u64, ignore: &str) -> Policy {
+        Policy { min_hits, ignore: parse_ignore(ignore) }
+    }
+
+    #[test]
+    fn blocklist_applies_threshold_ignore_list_and_public_only() {
+        let mut s = Stats::default();
+        for _ in 0..3 {
+            s.record(&ssh(NOW - 60.0, "1.2.3.4", "root", "x"));
+            s.record(&ssh(NOW - 60.0, "10.0.0.1", "root", "x"));
+            s.record(&ssh(NOW - 60.0, "5.6.7.8", "root", "x"));
+        }
+        s.record(&ssh(NOW - 60.0, "9.9.9.9", "root", "x"));
+        let list = s.blocklist(NOW, &policy(3, "5.6.7.0/24"));
+        assert_eq!(list, vec![Entry { ip: "1.2.3.4".into(), ssh: 3, http: 0, last_seen: (NOW - 60.0) as i64 }]);
+    }
+
+    #[test]
+    fn blocklist_sums_the_week_and_forgets_older_days() {
+        let mut s = Stats::default();
+        s.record(&ssh(NOW - 8.0 * 86400.0, "1.2.3.4", "a", "a"));
+        s.record(&ssh(NOW - 5.0 * 86400.0, "1.2.3.4", "a", "a"));
+        let mut e = ssh(NOW, "1.2.3.4", "a", "a");
+        e.service = "http";
+        s.record(&e);
+        assert_eq!(s.attackers.len(), 2);
+        let list = s.blocklist(NOW, &policy(1, ""));
+        assert_eq!((list[0].ssh, list[0].http, list[0].last_seen), (1, 1, NOW as i64));
+    }
+
+    #[test]
+    fn blocklist_is_sorted_and_capped() {
+        let mut s = Stats::default();
+        for i in 0..(BLOCKLIST_MAX + 10) {
+            let ip = format!("1.{}.{}.{}", i / 65536 + 1, (i / 256) % 256, i % 256);
+            s.record(&ssh(NOW, &ip, "a", "a"));
+        }
+        s.record(&ssh(NOW, "1.1.0.9", "a", "a"));
+        let list = s.blocklist(NOW, &policy(1, ""));
+        assert_eq!(list.len(), BLOCKLIST_MAX);
+        assert_eq!(list[0].ip, "1.1.0.9");
+    }
+
+    #[test]
+    fn old_stats_files_without_attackers_still_load() {
+        let old = r#"{"buckets":{"1800000000":{"total":1,"services":{},"usernames":{},"passwords":{},"paths":{},"countries":{},"user_agents":{},"points":{},"sources":[]}}}"#;
+        let s: Stats = serde_json::from_str(old).unwrap();
+        assert_eq!(s.buckets.len(), 1);
+        assert!(s.blocklist(NOW, &policy(1, "")).is_empty());
     }
 }

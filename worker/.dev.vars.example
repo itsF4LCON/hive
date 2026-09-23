@@ -1,2 +1,3 @@
 HIVE_SECRET=change-me-to-a-long-random-string
+HIVE_EXPORT_TOKEN=change-me-to-another-long-random-string
 ALLOWED_ORIGINS=https://xivlabs.tech,https://aps.xivlabs.tech,http://localhost:8899

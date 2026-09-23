@@ -8,6 +8,8 @@ use crate::geo::Location;
 pub struct Event {
     pub ts: f64,
     pub service: &'static str,
+    #[serde(skip)]
+    pub addr: IpAddr,
     pub ip: String,
     pub country: Option<String>,
     pub city: Option<String>,
@@ -25,6 +27,7 @@ impl Event {
         Event {
             ts: now_secs(),
             service,
+            addr: ip.to_canonical(),
             ip: mask_ip(ip),
             country: loc.country,
             city: loc.city,
@@ -72,6 +75,14 @@ mod tests {
     fn masks_v4_and_v6() {
         assert_eq!(mask_ip("203.0.113.57".parse().unwrap()), "203.0.113.x");
         assert_eq!(mask_ip("2001:db8:1:2::5".parse().unwrap()), "2001:db8:1::x");
+    }
+
+    #[test]
+    fn full_address_is_never_serialized() {
+        let e = Event::new("ssh", "1.2.3.4".parse().unwrap(), Location::default());
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("1.2.3.4"), "{json}");
+        assert!(json.contains("\"ip\":\"1.2.3.x\""), "{json}");
     }
 
     #[test]

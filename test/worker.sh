@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Exercises the hive Worker. Run `wrangler dev` in worker/ first (with HIVE_SECRET in .dev.vars).
+# Exercises the hive Worker. Run `wrangler dev` in worker/ first (with HIVE_SECRET and HIVE_EXPORT_TOKEN in .dev.vars).
 set -uo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8787}"
 SECRET="${HIVE_SECRET:?set HIVE_SECRET to the same value as worker/.dev.vars}"
+TOKEN="${HIVE_EXPORT_TOKEN:?set HIVE_EXPORT_TOKEN to the same value as worker/.dev.vars}"
 ORIGIN="${ORIGIN:-https://xivlabs.tech}"
 BODY=/tmp/hive_test_body
 pass=0
@@ -105,6 +106,31 @@ if [ -n "${LOCAL_DB_DIR:-}" ]; then
     | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['results'][0]['n'])")
   check "feed table is pruned to 500 rows" 500 "$rows"
 fi
+
+BLOCK=$(python3 -c "
+import json,time
+now=time.time()
+e=lambda ip,last=now: {'ip':ip,'ssh':5,'http':1,'last_seen':last}
+print(json.dumps({'sent_at':now,'events':[],'blocklist':[
+ e('1.2.3.4'), e('1.2.3.4'), e(' 2a01:4f8::1'), e('::ffff:5.6.7.8'),
+ e('10.0.0.1'), e('203.0.113.5'), e('fd00::1'), e('not-an-ip'), e('9.9.9.9', now-30*86400)]}))")
+check "blocklist batch is accepted" 200 "$(ingest "$BLOCK")"
+check "only public, recent, unique IPs are kept" '{"accepted":0,"blocklist":3,"stats":false}' "$(cat $BODY)"
+
+check "export without a token is rejected" 401 "$(curl -s -o $BODY -w '%{http_code}' "$BASE_URL/export")"
+check "export with a wrong token is rejected" 401 "$(curl -s -o $BODY -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}x" "$BASE_URL/export")"
+check "export with the token returns 200" 200 "$(curl -s -o $BODY -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE_URL/export")"
+python3 - "$BODY" <<'PY2'
+import json,sys
+x=json.load(open(sys.argv[1]))
+ips=[e['ip'] for e in x['blocklist']]
+assert ips==['1.2.3.4','2a01:4f8::1','5.6.7.8'], ips
+assert x['blocklist_updated_at'] and x['stats']['total_7d']==4, x
+print("PASS: /export returns the cleaned blocklist and the snapshot")
+PY2
+[ $? -eq 0 ] && pass=$((pass + 1)) || fail=$((fail + 1))
+check "export sends no CORS header" "" \
+  "$(curl -s -D - -o /dev/null -H "Origin: $ORIGIN" -H "Authorization: Bearer $TOKEN" "$BASE_URL/export" | tr -d '\r' | grep -i '^access-control-allow-origin')"
 
 check "GET /nope is 404" 404 "$(curl -s -o $BODY -w '%{http_code}' "$BASE_URL/nope")"
 

@@ -1,10 +1,12 @@
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::HashSet;
+use std::net::IpAddr;
 use wasm_bindgen::JsValue;
 use worker::*;
 
-const MAX_BODY_BYTES: usize = 256 * 1024;
+const MAX_BODY_BYTES: usize = 512 * 1024;
 const MAX_EVENTS_PER_BATCH: usize = 50;
 const KEEP_EVENTS: u32 = 500;
 const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
@@ -14,12 +16,23 @@ const RECENT_DEFAULT: u32 = 50;
 const RECENT_MAX: u32 = 100;
 const MAX_TOP: usize = 10;
 const MAX_POINTS: usize = 500;
+const MAX_BLOCKLIST: usize = 5000;
+const BLOCKLIST_WINDOW_SECS: f64 = 8.0 * 24.0 * 60.0 * 60.0;
 
 #[derive(Deserialize)]
 struct IngestBatch {
     sent_at: f64,
     events: Vec<IncomingEvent>,
     stats: Option<Stats>,
+    blocklist: Option<Vec<BlockEntry>>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct BlockEntry {
+    ip: String,
+    ssh: u64,
+    http: u64,
+    last_seen: f64,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +98,60 @@ struct Stats {
 #[derive(Deserialize)]
 struct SnapshotRow {
     body: String,
+}
+
+#[derive(Deserialize)]
+struct StoredRow {
+    body: String,
+    updated_at: f64,
+}
+
+fn clean_blocklist(entries: Vec<BlockEntry>, now: f64) -> Vec<BlockEntry> {
+    let mut seen = HashSet::new();
+    entries
+        .into_iter()
+        .filter(|e| e.last_seen >= now - BLOCKLIST_WINDOW_SECS && e.last_seen <= now + MAX_CLOCK_SKEW_SECS)
+        .filter_map(|e| {
+            let ip = e.ip.trim().parse::<IpAddr>().ok()?.to_canonical();
+            is_public(ip).then(|| BlockEntry { ip: ip.to_string(), last_seen: e.last_seen.floor(), ..e })
+        })
+        .filter(|e| seen.insert(e.ip.clone()))
+        .take(MAX_BLOCKLIST)
+        .collect()
+}
+
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || o[0] == 0
+                || o[0] >= 240
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] == 0x2001 && s[1] == 0x0db8))
+        }
+    }
+}
+
+fn token_matches(expected: &str, given: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), given.as_bytes());
+    !a.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn clean_top(rows: Vec<TopRow>) -> Vec<TopRow> {
@@ -242,6 +309,21 @@ async fn ingest(mut req: Request, env: &Env) -> Result<Response> {
         );
     }
     let has_stats = batch.stats.is_some();
+    let blocklist_len = match batch.blocklist {
+        Some(entries) => {
+            let entries = clean_blocklist(entries, now);
+            let n = entries.len();
+            statements.push(
+                db.prepare(
+                    "INSERT INTO blocklist (id, body, updated_at) VALUES (1, ?1, ?2) \
+                     ON CONFLICT(id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+                )
+                .bind(&[JsValue::from(serde_json::to_string(&entries)?), JsValue::from(now.floor())])?,
+            );
+            Some(n)
+        }
+        None => None,
+    };
     if let Some(stats) = batch.stats {
         statements.push(
             db.prepare(
@@ -257,7 +339,37 @@ async fn ingest(mut req: Request, env: &Env) -> Result<Response> {
     if !statements.is_empty() {
         db.batch(statements).await?;
     }
-    Response::from_json(&serde_json::json!({ "accepted": accepted, "stats": has_stats }))
+    let mut reply = serde_json::json!({ "accepted": accepted, "stats": has_stats });
+    if let Some(n) = blocklist_len {
+        reply["blocklist"] = n.into();
+    }
+    Response::from_json(&reply)
+}
+
+async fn export(req: &Request, env: &Env) -> Result<Response> {
+    let expected = env.secret("HIVE_EXPORT_TOKEN")?.to_string();
+    let given = req.headers().get("Authorization")?.unwrap_or_default();
+    if !token_matches(&expected, given.strip_prefix("Bearer ").unwrap_or("")) {
+        return Response::error("Unauthorized", 401);
+    }
+    let db = env.d1("hive_db")?;
+    let stats: serde_json::Value = serde_json::from_str(&build_stats(env).await?)?;
+    let blocklist = db
+        .prepare("SELECT body, updated_at FROM blocklist WHERE id = 1")
+        .first::<StoredRow>(None)
+        .await?;
+    let (entries, updated_at) = match blocklist {
+        Some(r) => (serde_json::from_str::<serde_json::Value>(&r.body)?, Some(r.updated_at)),
+        None => (serde_json::json!([]), None),
+    };
+    let mut res = Response::from_json(&serde_json::json!({
+        "generated_at": now_secs().floor(),
+        "stats": stats,
+        "blocklist": entries,
+        "blocklist_updated_at": updated_at,
+    }))?;
+    res.headers_mut().set("Cache-Control", "no-store")?;
+    Ok(res)
 }
 
 async fn build_stats(env: &Env) -> Result<String> {
@@ -315,6 +427,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     match (req.method(), path.as_str()) {
         (Method::Options, _) => with_cors(Response::empty()?, &origin),
         (Method::Post, "/ingest") => ingest(req, &env).await,
+        (Method::Get, "/export") => export(&req, &env).await,
         (Method::Get, "/stats") => {
             cached_json("https://hive.internal/stats", &origin, build_stats(&env)).await
         }
