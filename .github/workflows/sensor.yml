@@ -43,7 +43,7 @@ jobs:
         with:
           merge-multiple: true
       - run: sha256sum hive-sensor-* > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             hive-sensor-*
