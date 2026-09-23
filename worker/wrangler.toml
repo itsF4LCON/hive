@@ -15,4 +15,4 @@ ALLOWED_ORIGINS = "https://xivlabs.tech,https://aps.xivlabs.tech"
 [[d1_databases]]
 binding = "hive_db"
 database_name = "hive-db"
-database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+database_id = "2b86b3dd-06fd-4c6e-bc5c-375ccbcccae9"
