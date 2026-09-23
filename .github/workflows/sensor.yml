@@ -22,12 +22,12 @@ jobs:
       run:
         working-directory: sensor
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo build --release --locked
       - run: cp target/release/hive-sensor hive-sensor-${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: hive-sensor-${{ matrix.target }}
           path: sensor/hive-sensor-${{ matrix.target }}
@@ -39,7 +39,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       - run: sha256sum hive-sensor-* > SHA256SUMS
