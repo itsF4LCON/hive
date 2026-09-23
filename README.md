@@ -118,9 +118,19 @@ ENV
 sudo chmod 640 /etc/hive/env && sudo chgrp hive /etc/hive/env
 ```
 
-For locations on the map, create a free [MaxMind](https://www.maxmind.com/en/geolite2/signup) account,
-download **GeoLite2-City** (`.mmdb`), and copy it to `/etc/hive/GeoLite2-City.mmdb`. Without it the
-sensor still works, just without map points.
+For locations on the map, the sensor needs a city database in GeoIP2 format. The easiest is
+[DB-IP City Lite](https://db-ip.com/db/download/ip-to-city-lite), which is free, needs no account, and
+can be downloaded on the VM (it's updated monthly, so change the month in the URL):
+
+```bash
+curl -L https://download.db-ip.com/free/dbip-city-lite-2026-09.mmdb.gz | gunzip > city.mmdb
+sudo install -m 644 -o root -g hive city.mmdb /etc/hive/GeoLite2-City.mmdb && sudo systemctl restart hive-sensor
+```
+
+MaxMind's GeoLite2-City works too (free account required). The file is memory-mapped, so it barely
+counts toward the sensor's RAM. Always *replace* it with `install` as above and then restart; never
+edit it in place while the sensor runs. Without a database the sensor still works, just without map
+points.
 
 ```bash
 sudo cp hive-sensor.service /etc/systemd/system/
@@ -155,4 +165,4 @@ HIVE_INGEST_URL=http://localhost:8787/ingest HIVE_SECRET=... \
 HIVE_SSH_ADDR=127.0.0.1:2222 HIVE_HTTP_ADDR=127.0.0.1:8080 HIVE_STATE_DIR=/tmp/hive cargo run
 ```
 
-This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com.
+IP geolocation by [DB-IP](https://db-ip.com) (CC BY 4.0), or GeoLite2 data created by MaxMind, available from https://www.maxmind.com.
