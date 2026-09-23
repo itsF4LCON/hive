@@ -5,19 +5,22 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
-const MAX_EVENTS_PER_BATCH: usize = 500;
+const MAX_EVENTS_PER_BATCH: usize = 50;
+/// The feed only needs recent rows; older ones are pruned on every ingest.
+const KEEP_EVENTS: u32 = 500;
 const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
 const MAX_EVENT_AGE_SECS: f64 = 24.0 * 60.0 * 60.0;
-const RETENTION_SECS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
 const PUBLIC_CACHE_SECS: u32 = 30;
 const RECENT_DEFAULT: u32 = 50;
 const RECENT_MAX: u32 = 100;
-const TOP_N: u32 = 5;
+const MAX_TOP: usize = 10;
+const MAX_POINTS: usize = 500;
 
 #[derive(Deserialize)]
 struct IngestBatch {
     sent_at: f64,
     events: Vec<IncomingEvent>,
+    stats: Option<Stats>,
 }
 
 #[derive(Deserialize)]
@@ -52,25 +55,22 @@ struct EventRow {
     ua: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Default)]
 struct TopRow {
     k: Option<String>,
     n: u64,
 }
 
-#[derive(Deserialize, Serialize)]
-struct CountRow {
-    n: u64,
-}
-
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Default)]
 struct PointRow {
     lat: f64,
     lon: f64,
     n: u64,
 }
 
-#[derive(Serialize)]
+/// Aggregates computed on the sensor, which sees every event. Storing this one snapshot instead of
+/// a row per attack keeps D1 usage flat however hard the honeypot is hit.
+#[derive(Deserialize, Serialize, Default)]
 struct Stats {
     generated_at: f64,
     total_24h: u64,
@@ -83,6 +83,42 @@ struct Stats {
     top_countries: Vec<TopRow>,
     top_user_agents: Vec<TopRow>,
     points_24h: Vec<PointRow>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotRow {
+    body: String,
+}
+
+fn clean_top(rows: Vec<TopRow>) -> Vec<TopRow> {
+    rows.into_iter()
+        .take(MAX_TOP)
+        .map(|r| TopRow { k: clip(r.k, 256), n: r.n })
+        .collect()
+}
+
+impl Stats {
+    /// The snapshot is signed, but still bound its size and strip control characters before storing.
+    fn sanitized(self) -> Stats {
+        Stats {
+            generated_at: self.generated_at,
+            total_24h: self.total_24h,
+            total_7d: self.total_7d,
+            unique_sources_24h: self.unique_sources_24h,
+            by_service_24h: clean_top(self.by_service_24h),
+            top_usernames: clean_top(self.top_usernames),
+            top_passwords: clean_top(self.top_passwords),
+            top_paths: clean_top(self.top_paths),
+            top_countries: clean_top(self.top_countries),
+            top_user_agents: clean_top(self.top_user_agents),
+            points_24h: self
+                .points_24h
+                .into_iter()
+                .filter(|p| (-90.0..=90.0).contains(&p.lat) && (-180.0..=180.0).contains(&p.lon))
+                .take(MAX_POINTS)
+                .collect(),
+        }
+    }
 }
 
 fn now_secs() -> f64 {
@@ -174,7 +210,7 @@ async fn ingest(mut req: Request, env: &Env) -> Result<Response> {
 
     let db = env.d1("hive_db")?;
     let mut statements = Vec::with_capacity(batch.events.len());
-    for e in batch.events {
+    for e in batch.events.into_iter() {
         if e.service != "ssh" && e.service != "http" {
             continue;
         }
@@ -206,103 +242,40 @@ async fn ingest(mut req: Request, env: &Env) -> Result<Response> {
 
     let accepted = statements.len();
     if accepted > 0 {
+        statements.push(
+            db.prepare("DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?1")
+                .bind(&[JsValue::from(KEEP_EVENTS)])?,
+        );
+    }
+    let has_stats = batch.stats.is_some();
+    if let Some(stats) = batch.stats {
+        statements.push(
+            db.prepare(
+                "INSERT INTO snapshot (id, body, updated_at) VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+            )
+            .bind(&[
+                JsValue::from(serde_json::to_string(&stats.sanitized())?),
+                JsValue::from(now.floor()),
+            ])?,
+        );
+    }
+    if !statements.is_empty() {
         db.batch(statements).await?;
     }
-    Response::from_json(&serde_json::json!({ "accepted": accepted }))
-}
-
-async fn top(db: &D1Database, sql: &str, since: f64) -> Result<Vec<TopRow>> {
-    db.prepare(sql)
-        .bind(&[JsValue::from(since), JsValue::from(TOP_N)])?
-        .all()
-        .await?
-        .results::<TopRow>()
-}
-
-async fn count(db: &D1Database, sql: &str, since: f64) -> Result<u64> {
-    let row = db
-        .prepare(sql)
-        .bind(&[JsValue::from(since)])?
-        .first::<CountRow>(None)
-        .await?;
-    Ok(row.map(|r| r.n).unwrap_or(0))
+    Response::from_json(&serde_json::json!({ "accepted": accepted, "stats": has_stats }))
 }
 
 async fn build_stats(env: &Env) -> Result<String> {
-    let db = env.d1("hive_db")?;
-    let now = now_secs();
-    let day = now - 86_400.0;
-    let week = now - 7.0 * 86_400.0;
-
-    let stats = Stats {
-        generated_at: now.floor(),
-        total_24h: count(&db, "SELECT COUNT(*) AS n FROM events WHERE ts >= ?1", day).await?,
-        total_7d: count(&db, "SELECT COUNT(*) AS n FROM events WHERE ts >= ?1", week).await?,
-        unique_sources_24h: count(
-            &db,
-            "SELECT COUNT(DISTINCT ip_masked) AS n FROM events WHERE ts >= ?1",
-            day,
-        )
-        .await?,
-        by_service_24h: top(
-            &db,
-            "SELECT service AS k, COUNT(*) AS n FROM events WHERE ts >= ?1 \
-             GROUP BY service ORDER BY n DESC LIMIT ?2",
-            day,
-        )
-        .await?,
-        top_usernames: top(
-            &db,
-            "SELECT username AS k, COUNT(*) AS n FROM events \
-             WHERE service = 'ssh' AND ts >= ?1 AND username IS NOT NULL \
-             GROUP BY username ORDER BY n DESC LIMIT ?2",
-            week,
-        )
-        .await?,
-        top_passwords: top(
-            &db,
-            "SELECT password AS k, COUNT(*) AS n FROM events \
-             WHERE service = 'ssh' AND ts >= ?1 AND password IS NOT NULL \
-             GROUP BY password ORDER BY n DESC LIMIT ?2",
-            week,
-        )
-        .await?,
-        top_paths: top(
-            &db,
-            "SELECT path AS k, COUNT(*) AS n FROM events \
-             WHERE service = 'http' AND ts >= ?1 AND path IS NOT NULL AND path != '/' \
-             GROUP BY path ORDER BY n DESC LIMIT ?2",
-            week,
-        )
-        .await?,
-        top_countries: top(
-            &db,
-            "SELECT country AS k, COUNT(*) AS n FROM events \
-             WHERE ts >= ?1 AND country IS NOT NULL \
-             GROUP BY country ORDER BY n DESC LIMIT ?2",
-            week,
-        )
-        .await?,
-        top_user_agents: top(
-            &db,
-            "SELECT ua AS k, COUNT(*) AS n FROM events \
-             WHERE service = 'http' AND ts >= ?1 AND ua IS NOT NULL \
-             GROUP BY ua ORDER BY n DESC LIMIT ?2",
-            week,
-        )
-        .await?,
-        points_24h: db
-            .prepare(
-                "SELECT ROUND(lat, 1) AS lat, ROUND(lon, 1) AS lon, COUNT(*) AS n FROM events \
-                 WHERE ts >= ?1 AND lat IS NOT NULL AND lon IS NOT NULL \
-                 GROUP BY 1, 2 ORDER BY n DESC LIMIT 500",
-            )
-            .bind(&[JsValue::from(day)])?
-            .all()
-            .await?
-            .results::<PointRow>()?,
-    };
-    Ok(serde_json::to_string(&stats)?)
+    let row = env
+        .d1("hive_db")?
+        .prepare("SELECT body FROM snapshot WHERE id = 1")
+        .first::<SnapshotRow>(None)
+        .await?;
+    match row {
+        Some(r) => Ok(r.body),
+        None => Ok(serde_json::to_string(&Stats::default())?),
+    }
 }
 
 async fn build_recent(env: &Env, limit: u32) -> Result<String> {
@@ -310,7 +283,7 @@ async fn build_recent(env: &Env, limit: u32) -> Result<String> {
         .d1("hive_db")?
         .prepare(
             "SELECT ts, service, ip_masked, country, city, lat, lon, username, password, \
-             method, path, ua FROM events ORDER BY ts DESC, id DESC LIMIT ?1",
+             method, path, ua FROM events ORDER BY id DESC LIMIT ?1",
         )
         .bind(&[JsValue::from(limit)])?
         .all()
@@ -364,21 +337,5 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             cached_json(&key, &origin, build_recent(&env, limit)).await
         }
         _ => Response::error("Not found", 404),
-    }
-}
-
-#[event(scheduled)]
-pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    let cutoff = now_secs() - RETENTION_SECS;
-    let result = async {
-        env.d1("hive_db")?
-            .prepare("DELETE FROM events WHERE ts < ?1")
-            .bind(&[JsValue::from(cutoff)])?
-            .run()
-            .await
-    }
-    .await;
-    if let Err(e) = result {
-        console_error!("retention cleanup failed: {e}");
     }
 }

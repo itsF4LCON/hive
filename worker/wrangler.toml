@@ -12,9 +12,6 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
 [vars]
 ALLOWED_ORIGINS = "https://xivlabs.tech,https://aps.xivlabs.tech"
 
-[triggers]
-crons = ["17 3 * * *"]
-
 [[d1_databases]]
 binding = "hive_db"
 database_name = "hive-db"

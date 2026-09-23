@@ -5,8 +5,10 @@ forgotten nginx box. Bots find it on their own. Every login attempt and web prob
 and [xivlabs.tech](https://xivlabs.tech/#attacks) shows them on a world map as they happen.
 
 ```
- bots ──▶ :22 / :80 ──▶ hive-sensor (Rust, VM) ──signed batches──▶ hive Worker (Rust/WASM) ──▶ D1
-                                                                            ▲
+ bots ──▶ :22 / :80 ──▶ hive-sensor (Rust, VM) ──1 signed request/min──▶ hive Worker (Rust/WASM) ──▶ D1
+                        counts every event,        stats snapshot +                          1 snapshot row
+                        hourly buckets on disk     10 newest events                          + newest 500 events
+                                                                                ▲
                                                    xivlabs.tech ── GET /stats, /recent (cached 30s)
 ```
 
@@ -23,22 +25,35 @@ and [xivlabs.tech](https://xivlabs.tech/#attacks) shows them on a world map as t
 - **Privacy:** source IPs are masked to their network (`203.0.113.x`) inside the sensor, so full
   addresses never leave the VM. The public API only shows masked IPs and countries.
 
+## Why the sensor does the counting
+
+The Worker runs on Cloudflare's free plan, where D1 allows 100k rows written per day **across the whole
+account**. A public port 22 can draw tens of thousands of attempts a day, so storing one row per attempt
+would use that up, and break other projects sharing the account.
+
+So the sensor counts every event in memory instead. It keeps hourly buckets for 7 days, saves them to
+`stats.json` so restarts don't lose history, and caps distinct keys per bucket so memory stays bounded.
+Once a minute it sends a single signed request with the stats snapshot and the 10 newest events. The Worker
+upserts one snapshot row, inserts those events and prunes the feed back to 500 rows. That's at most about
+21 rows written per minute (~30k a day) however hard the honeypot is hit. `/stats` reads one row and
+`/recent` reads only the rows it returns, both behind a 30s edge cache.
+
 ## Layout
 
 | Path | What |
 |---|---|
 | `sensor/` | The Rust honeypot: SSH (`russh`), HTTP (`hyper`), GeoLite2 lookups, signed shipping |
 | `sensor/hive-sensor.service` | systemd unit |
-| `worker/` | Cloudflare Worker (Rust): `POST /ingest`, `GET /stats`, `GET /recent`, daily 30-day cleanup |
+| `worker/` | Cloudflare Worker (Rust): `POST /ingest`, `GET /stats`, `GET /recent` |
 | `test/worker.sh` | Tests for the Worker's auth, validation, IP masking and CORS |
 
 ## API
 
 | Endpoint | |
 |---|---|
-| `POST /ingest` | Sensor only. Body is `{sent_at, events[]}`, signed with `X-Hive-Signature: hex(HMAC-SHA256(secret, body))`. Batches more than 5 min off the Worker's clock are rejected. |
+| `POST /ingest` | Sensor only. Body is `{sent_at, events[≤50], stats?}`, signed with `X-Hive-Signature: hex(HMAC-SHA256(secret, body))`. Requests more than 5 min off the Worker's clock are rejected. The snapshot is size-capped and cleaned before it's stored. |
 | `GET /recent?limit=50` | Latest events (max 100) |
-| `GET /stats` | 24h/7d totals, unique sources, top usernames, passwords, paths, countries and user agents, and map points |
+| `GET /stats` | The latest snapshot: 24h/7d totals, unique sources, top usernames, passwords, paths, countries and user agents, and map points |
 
 The public endpoints are cached at the edge for 30s and only send CORS headers to origins in `ALLOWED_ORIGINS`.
 
@@ -59,22 +74,24 @@ wrangler deploy                         # serves on hive.xivlabs.tech
 
 1. Create an **Ampere A1** VM (1 OCPU and 6 GB is plenty) running Ubuntu 24.04. Always Free allows
    4 OCPU and 24 GB in total, shared with any other VMs you already have.
-2. **Move your real SSH off port 22 before anything else:**
-   ```bash
-   sudo sed -i 's/^#\?Port .*/Port 2200/' /etc/ssh/sshd_config
-   sudo iptables -I INPUT 6 -p tcp --dport 2200 -m state --state NEW -j ACCEPT
-   sudo systemctl daemon-reload && sudo systemctl restart ssh.socket   # Ubuntu 24.04 starts sshd via this socket
-   ```
-   Also allow 2200 in the security list (step 3) now.
-   Check that `ssh -p 2200 ubuntu@<vm-ip>` works from a **second terminal** before you close the first.
-3. In the VM's subnet **security list**, allow TCP 22 and 80 from `0.0.0.0/0`, and 2200 only from
+2. In the VM's subnet **security list**, allow TCP 22 and 80 from `0.0.0.0/0`, and 2200 only from
    your own IP.
-4. Oracle's Ubuntu images also firewall with iptables. Open the same ports there:
+3. **Move your real SSH to port 2200 before anything else.** Oracle's Ubuntu images also firewall
+   with iptables, so open the ports there too:
    ```bash
    for p in 22 80 2200; do sudo iptables -I INPUT 6 -p tcp --dport $p -m state --state NEW -j ACCEPT; done
    sudo netfilter-persistent save
+   sudo sed -i 's/^#\?Port .*/Port 2200/' /etc/ssh/sshd_config
+   sudo systemctl daemon-reload && sudo systemctl restart ssh.socket   # Ubuntu 24.04 starts sshd via this socket
    ```
-5. `sudo apt install unattended-upgrades` so the VM patches itself.
+   Check that `ssh -p 2200 ubuntu@<vm-ip>` works from a **second terminal** before you close the first.
+   Then check that nothing is left on 22:
+   ```bash
+   sudo ss -tlnp | grep -E ':(22|2200)\b'    # expect sshd on 2200 only
+   ```
+   If sshd still shows on 22, the image runs `ssh.service` instead of the socket: run
+   `sudo systemctl restart ssh` and check again.
+4. `sudo apt install unattended-upgrades` so the VM patches itself.
 
 ### 3. Sensor
 
@@ -103,7 +120,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now hive-sensor
 journalctl -u hive-sensor -f
 ```
 
-From your own machine, `ssh root@<vm-ip>` should show up in the journal, and on the map within about 30s.
+From your own machine, `ssh root@<vm-ip>` should show up in the journal right away, and on the map within about 2 minutes (one flush plus the 30s cache).
 
 ### Configuration
 
@@ -113,7 +130,7 @@ From your own machine, `ssh root@<vm-ip>` should show up in the journal, and on 
 | `HIVE_SECRET` | required | Shared HMAC secret |
 | `HIVE_SSH_ADDR` | `0.0.0.0:22` | |
 | `HIVE_HTTP_ADDR` | `0.0.0.0:80` | |
-| `HIVE_STATE_DIR` | `/var/lib/hive` | Holds the persistent SSH host key |
+| `HIVE_STATE_DIR` | `/var/lib/hive` | Holds the SSH host key and `stats.json` |
 | `HIVE_GEOIP_DB` | unset | Path to GeoLite2-City `.mmdb` |
 
 ## Development

@@ -4,6 +4,7 @@ mod http;
 mod limiter;
 mod shipper;
 mod ssh;
+mod stats;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ async fn main() {
 
     let shared = Arc::new(Shared {
         geo: geo::Geo::open(geoip.as_deref()),
-        shipper: shipper::Shipper::new(),
+        shipper: shipper::Shipper::new(state_dir.join("stats.json")),
         limiter: limiter::Limiter::new(256, 10),
     });
     eprintln!("hive-sensor: ssh on {ssh_addr}, http on {http_addr}, shipping to {ingest_url}");
@@ -61,6 +62,13 @@ async fn main() {
     tokio::spawn(ssh::serve(ssh_listener, host_key, shared.clone()));
     tokio::spawn(http::serve(http_listener, shared.clone()));
 
-    tokio::signal::ctrl_c().await.ok();
+    // systemd stops services with SIGTERM; Ctrl-C sends SIGINT. Save the counts on either.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
     eprintln!("hive-sensor: shutting down");
+    shared.shipper.save();
 }

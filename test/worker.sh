@@ -14,10 +14,26 @@ check() {
   else echo "FAIL: $1 (expected $2, got $3)"; echo "  body: $(head -c 300 $BODY)"; fail=$((fail + 1)); fi
 }
 
-# batch <sent_at offset secs> <events json> -> prints JSON body
+# batch <sent_at offset secs> <events json> [stats json] -> prints JSON body
 batch() {
-  python3 -c "import json,sys,time; print(json.dumps({'sent_at': time.time()+float(sys.argv[1]), 'events': json.loads(sys.argv[2])}))" "$1" "$2"
+  python3 -c "
+import json,sys,time
+b={'sent_at': time.time()+float(sys.argv[1]), 'events': json.loads(sys.argv[2])}
+if len(sys.argv) > 3: b['stats'] = json.loads(sys.argv[3])
+print(json.dumps(b))" "$@"
 }
+
+# A snapshot as the sensor sends it, plus junk the Worker must trim: 15 paths, a 1000-char key,
+# control characters and an impossible map point.
+STATS=$(python3 -c "
+import json
+top=lambda k,n: {'k':k,'n':n}
+print(json.dumps({'generated_at':0,'total_24h':3,'total_7d':4,'unique_sources_24h':3,
+ 'by_service_24h':[top('ssh',2),top('http',1)],
+ 'top_usernames':[top('root',2)], 'top_passwords':[top('123456',2)],
+ 'top_paths':[top('/.env',5), top('A'*1000,4)] + [top(f'/p{i}',1) for i in range(13)],
+ 'top_countries':[top('NL',2)], 'top_user_agents':[top('zgrab\\u001b[31m/0.x',1)],
+ 'points_24h':[{'lat':52.4,'lon':4.9,'n':2},{'lat':999,'lon':0,'n':1}]}))")
 sign() { printf '%s' "$1" | openssl dgst -sha256 -hmac "$SECRET" -r | cut -d' ' -f1; }
 ingest() {  # ingest <body> [signature]
   local sig="${2:-$(sign "$1")}"
@@ -39,17 +55,17 @@ print(json.dumps([
 
 echo "== Testing hive Worker at $BASE_URL =="
 
-GOOD=$(batch 0 "$EVENTS")
+GOOD=$(batch 0 "$EVENTS" "$STATS")
 check "no signature is rejected" 401 "$(curl -s -o $BODY -w '%{http_code}' -X POST "$BASE_URL/ingest" --data-binary "$GOOD")"
 check "wrong signature is rejected" 401 "$(ingest "$GOOD" "$(printf 'x' | openssl dgst -sha256 -hmac wrong -r | cut -d' ' -f1)")"
 check "stale batch is rejected" 401 "$(ingest "$(batch -600 "$EVENTS")")"
 check "future batch is rejected" 401 "$(ingest "$(batch 600 "$EVENTS")")"
 check "signed invalid JSON returns 400" 400 "$(ingest 'not json')"
-BIG=$(python3 -c "import json,time; print(json.dumps({'sent_at':time.time(),'events':[{'ts':time.time(),'service':'ssh','ip':'1.2.3.4'}]*501}))")
+BIG=$(python3 -c "import json,time; print(json.dumps({'sent_at':time.time(),'events':[{'ts':time.time(),'service':'ssh','ip':'1.2.3.4'}]*51}))")
 check "oversized batch is rejected" 413 "$(ingest "$BIG")"
 
 check "valid batch is accepted" 200 "$(ingest "$GOOD")"
-check "only ssh/http events within 24h are stored" '{"accepted":3}' "$(cat $BODY)"
+check "only ssh/http events within 24h are stored" '{"accepted":3,"stats":true}' "$(cat $BODY)"
 
 sleep 31  # let the 30s edge cache expire so reads see the new rows
 check "GET /recent returns 200" 200 "$(curl -s -o $BODY -w '%{http_code}' -H "Origin: $ORIGIN" "$BASE_URL/recent?limit=10")"
@@ -73,13 +89,26 @@ curl -s -o $BODY "$BASE_URL/stats"
 python3 - "$BODY" <<'PY'
 import json,sys
 s=json.load(open(sys.argv[1]))
-assert s['total_24h']>=3, s
-assert any(t['k']=='/.env' for t in s['top_paths']), s['top_paths']
-assert any(t['k']=='123456' for t in s['top_passwords']), s['top_passwords']
-assert len(s['points_24h'])>=1, s
-print("PASS: /stats aggregates the batch")
+assert s['total_24h']==3 and s['total_7d']==4, s
+paths=[t['k'] for t in s['top_paths']]
+assert paths[0]=='/.env' and len(paths)==10, paths
+assert len(paths[1])==256, len(paths[1])
+assert '\x1b' not in s['top_user_agents'][0]['k'], s['top_user_agents']
+assert s['points_24h']==[{'lat':52.4,'lon':4.9,'n':2}], s['points_24h']
+print("PASS: /stats serves the sanitized snapshot")
 PY
 [ $? -eq 0 ] && pass=$((pass + 1)) || fail=$((fail + 1))
+
+# 12 more batches of 50 events: the feed table must stay capped at 500 rows.
+for i in $(seq 1 12); do
+  FILL=$(python3 -c "import json,time; print(json.dumps([{'ts':time.time(),'service':'http','ip':'192.0.2.1','method':'GET','path':f'/fill{i}'} for i in range(50)]))")
+  ingest "$(batch 0 "$FILL")" >/dev/null
+done
+if [ -n "${LOCAL_DB_DIR:-}" ]; then
+  rows=$(cd "$LOCAL_DB_DIR" && wrangler d1 execute hive-db --local --json --command "SELECT COUNT(*) AS n FROM events" 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['results'][0]['n'])")
+  check "feed table is pruned to 500 rows" 500 "$rows"
+fi
 
 check "GET /nope is 404" 404 "$(curl -s -o $BODY -w '%{http_code}' "$BASE_URL/nope")"
 
