@@ -16,10 +16,8 @@ use crate::Shared;
 
 const CONNECTION_LIMIT: Duration = Duration::from_secs(30);
 
-/// Stock nginx welcome page, so the server looks like a forgotten default install.
 const PAGE: &str = "<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>\n<style>\nhtml { color-scheme: light dark; }\nbody { width: 35em; margin: 0 auto;\nfont-family: Tahoma, Verdana, Arial, sans-serif; }\n</style>\n</head>\n<body>\n<h1>Welcome to nginx!</h1>\n<p>If you see this page, the nginx web server is successfully installed and\nworking. Further configuration is required.</p>\n\n<p>For online documentation and support please refer to\n<a href=\"http://nginx.org/\">nginx.org</a>.<br/>\nCommercial support is available at\n<a href=\"http://nginx.com/\">nginx.com</a>.</p>\n\n<p><em>Thank you for using nginx.</em></p>\n</body>\n</html>\n";
 
-/// Records the request line and User-Agent. The body is never read.
 fn record(req: &Request<Incoming>, ip: IpAddr, shared: &Shared) {
     let mut e = Event::new("http", ip, shared.geo.lookup(ip));
     e.method = clip(req.method().as_str(), 16);

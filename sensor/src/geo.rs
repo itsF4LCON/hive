@@ -10,19 +10,13 @@ pub struct Location {
     pub lon: Option<f64>,
 }
 
-/// Offline lookups in a GeoIP2/GeoLite2-City-format database (MaxMind GeoLite2 or DB-IP City Lite).
-/// Without a database every lookup is empty, which is fine for local testing.
 pub struct Geo {
     reader: Option<Reader<Mmap>>,
 }
 
 impl Geo {
     pub fn open(path: Option<&Path>) -> Self {
-        // City databases are 60-130 MB. Memory-mapping keeps them out of the heap: the kernel pages
-        // in what lookups touch and can drop it again under memory pressure.
-        //
-        // SAFETY: the mapped file must not be modified while the sensor runs. Updates replace it
-        // with a new file (install/mv create a new inode) and then restart the service.
+        // SAFETY: never modify the database file in place; replace it (install/mv) and restart.
         let reader = path.and_then(|p| match unsafe { Reader::open_mmap(p) } {
             Ok(r) => Some(r),
             Err(e) => {

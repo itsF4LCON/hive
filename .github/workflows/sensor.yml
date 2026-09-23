@@ -26,7 +26,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo build --release --locked
-      # Built on 22.04 so the binary only needs glibc 2.35 and runs on Ubuntu 22.04 and newer.
       - run: |
           objdump -T target/release/hive-sensor | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
           cp target/release/hive-sensor hive-sensor-${{ matrix.target }}

@@ -3,7 +3,6 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Caps open connections overall and per source IP, shared by every service.
 pub struct Limiter {
     global: Arc<Semaphore>,
     per_ip: Mutex<HashMap<IpAddr, u32>>,

@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::geo::Location;
 
-/// One thing an attacker did. `ip` is already masked; the full address never leaves this process.
 #[derive(Serialize, Clone, Debug)]
 pub struct Event {
     pub ts: f64,
@@ -47,7 +46,6 @@ pub fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// 203.0.113.57 -> 203.0.113.x, 2001:db8:1:2::5 -> 2001:db8:1::x
 pub fn mask_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v4) => {
@@ -61,7 +59,6 @@ pub fn mask_ip(ip: IpAddr) -> String {
     }
 }
 
-/// Attacker-controlled strings: drop control characters and cap the length.
 pub fn clip(s: &str, max_chars: usize) -> Option<String> {
     let v: String = s.chars().filter(|c| !c.is_control()).take(max_chars).collect();
     (!v.is_empty()).then_some(v)

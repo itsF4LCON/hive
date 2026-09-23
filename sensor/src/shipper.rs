@@ -9,18 +9,11 @@ use std::time::Duration;
 use crate::event::{now_secs, Event};
 use crate::stats::Stats;
 
-/// Recent events waiting to be shown in the live feed. Everything is counted in `Stats` on arrival;
-/// this queue only holds candidates for the feed, so it can stay small.
 const MAX_QUEUED: usize = 50;
-/// Feed events sent per flush. With one flush a minute this keeps the Worker at roughly
-/// 1 snapshot + 10 inserts + 10 pruned rows per minute, whatever the attack volume.
 const FEED_PER_FLUSH: usize = 10;
 const FLUSH_EVERY: Duration = Duration::from_secs(60);
-/// Stay well under the Worker's 256 KB body limit.
 const MAX_BODY_BYTES: usize = 128 * 1024;
 
-/// Counts every event, then ships a stats snapshot plus the newest events to the Worker in one
-/// signed request per minute.
 pub struct Shipper {
     stats: Mutex<Stats>,
     stats_path: PathBuf,
@@ -29,9 +22,7 @@ pub struct Shipper {
 }
 
 enum SendError {
-    /// Network trouble or a 5xx/429: keep the data and try again next minute.
     Retry(String),
-    /// The Worker rejected the request itself (bad secret, clock, payload): retrying can't help.
     Reject(String),
 }
 
@@ -41,7 +32,6 @@ impl Shipper {
             stats: Mutex::new(Stats::load(&stats_path)),
             stats_path,
             queue: Mutex::new(VecDeque::new()),
-            // Send a snapshot on the first tick even if nothing new arrives.
             dirty: AtomicBool::new(true),
         }
     }
@@ -62,7 +52,6 @@ impl Shipper {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
-    /// The newest events for the feed, oldest first so the Worker inserts them in time order.
     fn take_feed(&self) -> Vec<Event> {
         let mut q = self.queue.lock().unwrap();
         let skip = q.len().saturating_sub(FEED_PER_FLUSH);
@@ -90,7 +79,6 @@ impl Shipper {
                 "stats": snapshot,
             }))
             .expect("events serialize");
-            // Each event is capped at a few hundred bytes, so this only trims in odd cases.
             if body.len() <= MAX_BODY_BYTES || events.is_empty() {
                 return body;
             }
@@ -173,7 +161,6 @@ mod tests {
 
     #[test]
     fn signature_matches_openssl_hmac() {
-        // printf 'hello' | openssl dgst -sha256 -hmac key
         assert_eq!(sign("key", b"hello"), "9307b3b915efb5171ff14d8cb55fbcc798c6c0ef1456d66ded1a6aa723a58b7b");
     }
 

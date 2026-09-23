@@ -12,8 +12,6 @@ use crate::Shared;
 
 const SESSION_LIMIT: Duration = Duration::from_secs(60);
 
-/// Low-interaction SSH: every login attempt is recorded and rejected. No channel, shell or command
-/// is ever opened, because authentication never succeeds.
 struct Trap {
     ip: IpAddr,
     shared: Arc<Shared>,
@@ -28,8 +26,6 @@ impl Handler for Trap {
         e.password = clip(password, 64);
         eprintln!("ssh  {:<16} {:?} / {:?}", e.ip, e.username, e.password);
         self.shared.shipper.push(e);
-        // Plain `Auth::reject()` makes russh stop offering passwords on this connection. Keep
-        // offering them so bots try their whole list; `max_auth_attempts` still ends the session.
         Ok(Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(&[MethodKind::Password][..])),
             partial_success: false,
@@ -58,7 +54,6 @@ pub fn load_or_create_host_key(path: &Path) -> std::io::Result<PrivateKey> {
 
 pub async fn serve(listener: TcpListener, host_key: PrivateKey, shared: Arc<Shared>) {
     let config = Arc::new(Config {
-        // Look like a stock Ubuntu server so bots go ahead and try credentials.
         server_id: SshId::Standard("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5".into()),
         methods: MethodSet::from(&[MethodKind::Password, MethodKind::PublicKey][..]),
         auth_rejection_time: Duration::from_secs(1),
@@ -80,7 +75,7 @@ pub async fn serve(listener: TcpListener, host_key: PrivateKey, shared: Arc<Shar
         };
         let ip = peer.ip().to_canonical();
         let Some(permit) = shared.limiter.try_acquire(ip) else {
-            continue; // over the connection cap: drop the socket
+            continue;
         };
         let config = config.clone();
         let shared = shared.clone();
@@ -88,7 +83,6 @@ pub async fn serve(listener: TcpListener, host_key: PrivateKey, shared: Arc<Shar
             let _permit = permit;
             let _ = stream.set_nodelay(true);
             let session = async {
-                // A failed handshake is normal scanner noise, so errors are ignored.
                 if let Ok(running) = russh::server::run_stream(config, stream, Trap { ip, shared }).await {
                     let _ = running.await;
                 }

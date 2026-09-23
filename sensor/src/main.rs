@@ -62,7 +62,6 @@ async fn main() {
     tokio::spawn(ssh::serve(ssh_listener, host_key, shared.clone()));
     tokio::spawn(http::serve(http_listener, shared.clone()));
 
-    // systemd stops services with SIGTERM; Ctrl-C sends SIGINT. Save the counts on either.
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("SIGTERM handler");
     tokio::select! {

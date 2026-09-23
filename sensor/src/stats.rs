@@ -1,6 +1,3 @@
-//! Running totals, kept on the sensor so the Worker's database only ever stores one small snapshot
-//! instead of a row per attack. Counts live in hourly buckets for 7 days and are saved to disk.
-
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -9,10 +6,7 @@ use crate::event::Event;
 
 const HOUR: i64 = 3600;
 const KEEP_HOURS: i64 = 7 * 24;
-/// Distinct keys tracked per list per hour. Once full, already-known keys keep counting, so the
-/// top entries stay accurate while memory stays bounded (~30 MB worst case).
 const MAP_CAP: usize = 300;
-/// Distinct masked sources tracked per hour, for the "sources in 24h" counter.
 const SOURCE_CAP: usize = 5000;
 const TOP_N: usize = 5;
 const MAX_POINTS: usize = 500;
@@ -26,7 +20,6 @@ struct Bucket {
     paths: HashMap<String, u64>,
     countries: HashMap<String, u64>,
     user_agents: HashMap<String, u64>,
-    /// "lat,lon" rounded to 0.1 degrees
     points: HashMap<String, u64>,
     sources: HashSet<String>,
 }
@@ -49,7 +42,6 @@ pub struct Point {
     pub n: u64,
 }
 
-/// Same shape the Worker serves from `GET /stats`.
 #[derive(Serialize, Debug)]
 pub struct Snapshot {
     pub generated_at: f64,
@@ -99,7 +91,6 @@ impl Stats {
         bump(&mut b.services, Some(e.service));
         bump(&mut b.usernames, e.username.as_deref());
         bump(&mut b.passwords, e.password.as_deref());
-        // "/" is every scanner's first request, so it would always top the list and say nothing.
         bump(&mut b.paths, e.path.as_deref().filter(|p| *p != "/"));
         bump(&mut b.countries, e.country.as_deref());
         bump(&mut b.user_agents, e.ua.as_deref());
@@ -158,7 +149,6 @@ impl Stats {
         }
     }
 
-    /// Write to a temp file and rename, so a crash mid-write never leaves a corrupt file.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_vec(self)?)?;

@@ -11,11 +11,9 @@ ExecStart=/usr/local/bin/hive-sensor
 Restart=always
 RestartSec=5
 
-# Bind 22 and 80 without root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# Sandbox: the only writable place is its own state dir (the SSH host key).
 StateDirectory=hive
 StateDirectoryMode=0700
 NoNewPrivileges=yes

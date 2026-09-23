@@ -6,7 +6,6 @@ use worker::*;
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_EVENTS_PER_BATCH: usize = 50;
-/// The feed only needs recent rows; older ones are pruned on every ingest.
 const KEEP_EVENTS: u32 = 500;
 const MAX_CLOCK_SKEW_SECS: f64 = 300.0;
 const MAX_EVENT_AGE_SECS: f64 = 24.0 * 60.0 * 60.0;
@@ -68,8 +67,6 @@ struct PointRow {
     n: u64,
 }
 
-/// Aggregates computed on the sensor, which sees every event. Storing this one snapshot instead of
-/// a row per attack keeps D1 usage flat however hard the honeypot is hit.
 #[derive(Deserialize, Serialize, Default)]
 struct Stats {
     generated_at: f64,
@@ -98,7 +95,6 @@ fn clean_top(rows: Vec<TopRow>) -> Vec<TopRow> {
 }
 
 impl Stats {
-    /// The snapshot is signed, but still bound its size and strip control characters before storing.
     fn sanitized(self) -> Stats {
         Stats {
             generated_at: self.generated_at,
@@ -125,8 +121,6 @@ fn now_secs() -> f64 {
     Date::now().as_millis() as f64 / 1000.0
 }
 
-/// Keep the network, drop the host: 203.0.113.57 -> 203.0.113.x, 2001:db8:1:2::5 -> 2001:db8:1::x.
-/// Applied again here even though the sensor already masks, so a full IP can never be stored.
 fn mask_ip(ip: &str) -> String {
     let ip = ip.trim();
     if ip.contains(':') {
@@ -292,7 +286,6 @@ async fn build_recent(env: &Env, limit: u32) -> Result<String> {
     Ok(serde_json::to_string(&rows)?)
 }
 
-/// Serve a public JSON endpoint through the edge cache, so a busy page costs one D1 query per 30s.
 async fn cached_json(cache_key: &str, origin: &Option<String>, build: impl std::future::Future<Output = Result<String>>) -> Result<Response> {
     let cache = Cache::default();
     let body = match cache.get(cache_key, false).await? {

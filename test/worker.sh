@@ -14,7 +14,6 @@ check() {
   else echo "FAIL: $1 (expected $2, got $3)"; echo "  body: $(head -c 300 $BODY)"; fail=$((fail + 1)); fi
 }
 
-# batch <sent_at offset secs> <events json> [stats json] -> prints JSON body
 batch() {
   python3 -c "
 import json,sys,time
@@ -23,8 +22,6 @@ if len(sys.argv) > 3: b['stats'] = json.loads(sys.argv[3])
 print(json.dumps(b))" "$@"
 }
 
-# A snapshot as the sensor sends it, plus junk the Worker must trim: 15 paths, a 1000-char key,
-# control characters and an impossible map point.
 STATS=$(python3 -c "
 import json
 top=lambda k,n: {'k':k,'n':n}
@@ -35,7 +32,7 @@ print(json.dumps({'generated_at':0,'total_24h':3,'total_7d':4,'unique_sources_24
  'top_countries':[top('NL',2)], 'top_user_agents':[top('zgrab\\u001b[31m/0.x',1)],
  'points_24h':[{'lat':52.4,'lon':4.9,'n':2},{'lat':999,'lon':0,'n':1}]}))")
 sign() { printf '%s' "$1" | openssl dgst -sha256 -hmac "$SECRET" -r | cut -d' ' -f1; }
-ingest() {  # ingest <body> [signature]
+ingest() {
   local sig="${2:-$(sign "$1")}"
   curl -s -o $BODY -w "%{http_code}" -X POST "$BASE_URL/ingest" -H "X-Hive-Signature: $sig" --data-binary "$1"
 }
@@ -67,7 +64,7 @@ check "oversized batch is rejected" 413 "$(ingest "$BIG")"
 check "valid batch is accepted" 200 "$(ingest "$GOOD")"
 check "only ssh/http events within 24h are stored" '{"accepted":3,"stats":true}' "$(cat $BODY)"
 
-sleep 31  # let the 30s edge cache expire so reads see the new rows
+sleep 31
 check "GET /recent returns 200" 200 "$(curl -s -o $BODY -w '%{http_code}' -H "Origin: $ORIGIN" "$BASE_URL/recent?limit=10")"
 python3 - "$BODY" <<'PY'
 import json,sys
@@ -99,7 +96,6 @@ print("PASS: /stats serves the sanitized snapshot")
 PY
 [ $? -eq 0 ] && pass=$((pass + 1)) || fail=$((fail + 1))
 
-# 12 more batches of 50 events: the feed table must stay capped at 500 rows.
 for i in $(seq 1 12); do
   FILL=$(python3 -c "import json,time; print(json.dumps([{'ts':time.time(),'service':'http','ip':'192.0.2.1','method':'GET','path':f'/fill{i}'} for i in range(50)]))")
   ingest "$(batch 0 "$FILL")" >/dev/null
