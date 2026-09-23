@@ -72,35 +72,43 @@ wrangler deploy                         # serves on hive.xivlabs.tech
 
 ### 2. VM (Oracle Cloud Always Free)
 
-1. Create an **Ampere A1** VM (1 OCPU and 6 GB is plenty) running Ubuntu 24.04. Always Free allows
-   4 OCPU and 24 GB in total, shared with any other VMs you already have.
-2. In the VM's subnet **security list**, allow TCP 22 and 80 from `0.0.0.0/0`, and 2200 only from
-   your own IP.
+1. Create an Always Free VM running Ubuntu 24.04 or 22.04: an **Ampere A1** (1 OCPU / 6 GB) if you have
+   ARM allowance left, or an AMD **VM.Standard.E2.1.Micro** (1 GB is plenty; use the x86 binary).
+2. Create a **Network Security Group** with ingress TCP 22 and 80 from `0.0.0.0/0` and TCP 2200 from
+   your own IP, and attach it to the VM's VNIC. An NSG only affects this VM, while a subnet security
+   list would also open the ports on every other VM in the subnet.
 3. **Move your real SSH to port 2200 before anything else.** Oracle's Ubuntu images also firewall
    with iptables, so open the ports there too:
    ```bash
-   for p in 22 80 2200; do sudo iptables -I INPUT 6 -p tcp --dport $p -m state --state NEW -j ACCEPT; done
+   # Insert the rules just before the image's catch-all REJECT (its position varies between images).
+   reject=$(sudo iptables -L INPUT --line-numbers -n | awk '/REJECT/ {print $1; exit}')
+   for p in 80 2200; do sudo iptables -I INPUT "$reject" -p tcp --dport $p -m state --state NEW -j ACCEPT; done
+   sudo iptables -L INPUT -n --line-numbers    # 22 (already allowed by the image), 2200 and 80 must be above REJECT
    sudo netfilter-persistent save
    sudo sed -i 's/^#\?Port .*/Port 2200/' /etc/ssh/sshd_config
-   sudo systemctl daemon-reload && sudo systemctl restart ssh.socket   # Ubuntu 24.04 starts sshd via this socket
+   # 24.04 starts sshd through ssh.socket, 22.04 through ssh.service. Never start the socket on 22.04:
+   # it would listen on port 22 and take it from the honeypot.
+   if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+     sudo systemctl daemon-reload && sudo systemctl restart ssh.socket
+   else
+     sudo systemctl restart ssh
+   fi
    ```
    Check that `ssh -p 2200 ubuntu@<vm-ip>` works from a **second terminal** before you close the first.
    Then check that nothing is left on 22:
    ```bash
    sudo ss -tlnp | grep -E ':(22|2200)\b'    # expect sshd on 2200 only
    ```
-   If sshd still shows on 22, the image runs `ssh.service` instead of the socket: run
-   `sudo systemctl restart ssh` and check again.
 4. `sudo apt install unattended-upgrades` so the VM patches itself.
 
 ### 3. Sensor
 
-Download `hive-sensor-aarch64-unknown-linux-gnu` from the latest release, or build it on the VM with
-`cargo build --release` in `sensor/`. Then:
+Download the binary for your VM from the latest release (`aarch64` for Ampere, `x86_64` for the AMD
+Micro), or build it on the VM with `cargo build --release` in `sensor/`. Then:
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin hive
-sudo install -m 755 hive-sensor-aarch64-unknown-linux-gnu /usr/local/bin/hive-sensor
+sudo install -m 755 hive-sensor-* /usr/local/bin/hive-sensor
 sudo install -d -m 750 -o root -g hive /etc/hive
 sudo tee /etc/hive/env >/dev/null <<'ENV'
 HIVE_INGEST_URL=https://hive.xivlabs.tech/ingest
